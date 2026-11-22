@@ -1,6 +1,6 @@
 # MultiCodexUsage for Windows
 
-This fork is based on Michael Guber's [Codex Usage for Windows](https://github.com/guberm/Codex-Usage-Windows). It adds multiple ChatGPT accounts and shows each account's limits and reset times in one panel. The original copyright and terms are preserved in [LICENSE](LICENSE).
+This fork is based on [Codex Usage for Windows](https://github.com/guberm/Codex-Usage-Windows) by Michael Guber ([@guberm](https://github.com/guberm)). It adds support for multiple ChatGPT accounts and shows each account's limits and reset times in one panel. The original copyright and terms are preserved in [LICENSE](LICENSE).
 
 A tiny, native Windows companion for Codex usage. Keep a **190 × 36 DIP floating pill** near your taskbar: remaining percentage and time until reset. Click for details; drag to move.
 
@@ -29,11 +29,13 @@ The executable is unsigned. Release checksums are provided in `SHA256SUMS.txt`.
 
 This is a floating window above the taskbar work area, not an embedded Windows taskbar extension. A `!` marks stale data or a refresh error; an elapsed countdown does not invent a new allowance. If a monitor is removed, the window is brought back onto an available screen. Use the tray's **Move near taskbar** to recover its position.
 
-<details><summary>Expanded preview (example data)</summary>
+### Multi-account preview
 
-![Expanded preview with example data](docs/expanded.png)
+Each account has its own section with the remaining allowance, reset time and countdown. The highlighted account supplies the tray reading, and all other accounts remain visible in the panel.
 
-</details>
+<img src="docs/accounts.png" width="340" alt="Demo panel showing three ChatGPT accounts, two with different Codex usage limits and reset countdowns and one waiting for usage data">
+
+*Example data from the UI smoke test.*
 
 ## Privacy and authentication
 
