@@ -21,6 +21,9 @@ public partial class MainWindow : Window
 {
     private readonly Storage storage;
     private readonly CodexApi api;
+    private readonly List<Account> accounts = new();
+    private Account? activeAccount;
+    private bool updatingAccountBox;
     private readonly bool demo;
     private readonly string? smokeOutput;
     private readonly Forms.NotifyIcon tray = new();
@@ -28,20 +31,40 @@ public partial class MainWindow : Window
     private readonly CancellationTokenSource lifetime = new();
     private CancellationTokenSource? login;
     private Settings settings = new();
-    private Usage? usage;
-    private bool busy, signedIn, expanded, dragging, closing, pendingReset, recovery;
+    private Usage? demoUsage;
+    private Usage? usage => activeAccount?.Usage ?? demoUsage;
+    private bool signedIn => activeAccount != null || demoUsage != null;
+    private bool busy, expanded, dragging, closing, recovery;
     private Point? dragStart;
     private DateTimeOffset lastAttempt;
     private string? error;
+    private string? loginError;
     private string? trayPercent;
+    private sealed class Account(Storage store, Session session, Usage? usage, bool pendingReset)
+    {
+        public Storage Store { get; } = store;
+        public CodexApi Api { get; } = new(store);
+        public string Id { get; } = session.AccountId;
+        public string Label { get; set; } = AccountLabelFor(session);
+        public Usage? Usage { get; set; } = usage;
+        public bool PendingReset { get; set; } = pendingReset;
+        public string? Error { get; set; }
+    }
+    private static string AccountLabelFor(Session session) => string.IsNullOrWhiteSpace(session.Email)
+        ? $"ChatGPT · {session.AccountId}"
+        : $"{session.Email} · {session.AccountId[^Math.Min(8, session.AccountId.Length)..]}";
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     public MainWindow(Storage storage, bool demo, string? smokeOutput)
     {
         this.storage = storage; this.demo = demo; this.smokeOutput = smokeOutput;
         api = new(storage);
         InitializeComponent();
-        try { settings = storage.Read<Settings>("settings.json") ?? new(); var session = storage.LoadSession(); signedIn = session != null; if (session != null) { usage = storage.Read<Usage>("usage.json"); pendingReset = storage.HasPendingReset(session.AccountId); } }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or CryptographicException) { error = "Could not load saved data. Sign out, then sign in again."; recovery = true; }
+        try { settings = storage.Read<Settings>("settings.json") ?? new(); }
+        catch (Exception e) when (IsStorageError(e)) { error = "Could not load saved preferences."; }
+        LoadAccount(storage);
+        try { foreach (var store in storage.AccountStores()) LoadAccount(store); }
+        catch (Exception e) when (IsStorageError(e)) { error = "Could not load the saved account list."; }
+        SelectAccount(accounts.Find(account => account.Id == settings.SelectedAccountId) ?? accounts.FirstOrDefault());
         Topmost = settings.Pinned; PinnedCheck.IsChecked = settings.Pinned;
         NotifyCheck.IsChecked = settings.Notify;
         IntervalBox.SelectedIndex = ClampIntervalIndex(settings.RefreshMinutes);
@@ -75,12 +98,52 @@ public partial class MainWindow : Window
             lifetime.Dispose();
         };
     }
+    private static bool IsStorageError(Exception e) => e is IOException or UnauthorizedAccessException or JsonException or CryptographicException;
+    private void LoadAccount(Storage store)
+    {
+        Session? session;
+        try { session = store.LoadSession(); }
+        catch (Exception e) when (IsStorageError(e))
+        {
+            recovery |= store == storage;
+            error = "Could not unlock a saved account. Sign in to it again.";
+            return;
+        }
+        if (session == null || accounts.Exists(account => account.Id == session.AccountId)) return;
+        var account = new Account(store, session, null, false);
+        accounts.Add(account);
+        try
+        {
+            account.Usage = store.Read<Usage>("usage.json");
+            account.PendingReset = store.HasPendingReset(session.AccountId);
+        }
+        catch (Exception e) when (IsStorageError(e)) { account.Error = "Could not load saved usage. Refresh to try again."; }
+    }
+    private void SelectAccount(Account? account)
+    {
+        activeAccount = account;
+        settings = settings with { SelectedAccountId = account?.Id };
+        updatingAccountBox = true;
+        AccountBox.ItemsSource = accounts.Select(item => item.Label).ToArray();
+        AccountBox.SelectedIndex = account == null ? -1 : accounts.IndexOf(account);
+        updatingAccountBox = false;
+    }
+    private void AccountChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (updatingAccountBox || AccountBox.SelectedIndex < 0) return;
+        activeAccount = accounts[AccountBox.SelectedIndex];
+        settings = settings with { SelectedAccountId = activeAccount.Id };
+        error = null;
+        loginError = null;
+        TrySaveSettings();
+        Render();
+    }
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
         // Wait until WPF finishes creating the native window before resizing it.
         await Dispatcher.Yield(DispatcherPriority.ContextIdle);
         if (settings.Left is double x && settings.Top is double y && double.IsFinite(x) && double.IsFinite(y)) { Left = x; Top = y; KeepVisible(); } else Dock();
-        if (demo && smokeOutput == null) { usage = DemoUsage(); signedIn = true; }
+        if (demo && smokeOutput == null) demoUsage = DemoUsage();
         Render();
         if (!signedIn) SetExpanded(true);
         if (smokeOutput != null) { await RunSmoke(); return; }
@@ -159,31 +222,40 @@ public partial class MainWindow : Window
     private async void RefreshClick(object sender, RoutedEventArgs e) => await Refresh("manual");
     private async Task Refresh(string trigger)
     {
-        if (busy) { if (signedIn && !demo && !closing) storage.Log.RecordSkipped(trigger, "busy"); return; }
+        if (busy) { if (!closing) activeAccount?.Store.Log.RecordSkipped(trigger, "busy"); return; }
         if (!signedIn || demo || closing) return;
         busy = true; lastAttempt = DateTimeOffset.UtcNow; Render();
-        try { await FetchAndRender(trigger); }
-        catch (Exception e) { error = FriendlyError(e); }
+        error = null;
+        try
+        {
+            foreach (var account in accounts)
+            {
+                if (closing) break;
+                try { await FetchAccount(account, trigger); }
+                catch (Exception e) { account.Error = FriendlyError(e); }
+            }
+        }
         finally { busy = false; if (!closing) Render(); }
     }
-    private async Task FetchAndRender(string trigger)
+    private async Task FetchAccount(Account account, string trigger)
     {
         var started = Stopwatch.GetTimestamp();
-        var previous = usage;
+        var previous = account.Usage;
         Usage? next = null;
         try {
-            next = await api.Fetch(lifetime.Token);
-            storage.Save("usage.json", next);
+            next = await account.Api.Fetch(lifetime.Token);
+            account.Store.Save("usage.json", next);
         } catch (Exception e) {
-            storage.Log.RecordFetch(trigger, Stopwatch.GetElapsedTime(started), previous, next, e);
+            account.Store.Log.RecordFetch(trigger, Stopwatch.GetElapsedTime(started), previous, next, e);
             throw;
         }
         var updated = next!;
         var delta = Usage.Change(previous?.Windows.FirstOrDefault()?.Remaining, updated.Windows[0].Remaining);
-        usage = updated; error = null;
-        storage.Log.RecordFetch(trigger, Stopwatch.GetElapsedTime(started), previous, updated, null);
-        if (settings.Notify && delta != null) tray.ShowBalloonTip(5000, "Codex usage changed", $"{updated.Windows[0].Remaining}% remaining ({delta:+0;-0}%). Resets in {Usage.Countdown(updated.Windows[0].ResetAt, DateTimeOffset.UtcNow)}.", Forms.ToolTipIcon.Info);
-        if (settings.Notify) foreach (var reminder in Usage.ResetReminders(previous, updated, DateTimeOffset.UtcNow.ToUnixTimeSeconds())) tray.ShowBalloonTip(5000, "Codex limit reset", reminder, Forms.ToolTipIcon.Info);
+        account.Usage = updated; account.Error = null;
+        account.Store.Log.RecordFetch(trigger, Stopwatch.GetElapsedTime(started), previous, updated, null);
+        if (closing || !settings.Notify) return;
+        if (delta != null) tray.ShowBalloonTip(5000, "Codex usage changed", $"{account.Label}: {updated.Windows[0].Remaining}% remaining ({delta:+0;-0}%). Resets in {Usage.Countdown(updated.Windows[0].ResetAt, DateTimeOffset.UtcNow)}.", Forms.ToolTipIcon.Info);
+        foreach (var reminder in Usage.ResetReminders(previous, updated, DateTimeOffset.UtcNow.ToUnixTimeSeconds())) tray.ShowBalloonTip(5000, "Codex limit reset", $"{account.Label}: {reminder}", Forms.ToolTipIcon.Info);
     }
     private static string FriendlyError(Exception e) => e switch {
         HttpRequestException { StatusCode: HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden } => "Session rejected. Sign out and sign in again.",
@@ -199,28 +271,55 @@ public partial class MainWindow : Window
     private void Render()
     {
         if (closing) return;
+        var accountError = activeAccount?.Error;
+        var pendingReset = activeAccount?.PendingReset == true;
         var selected = usage?.Windows.ElementAtOrDefault(Math.Clamp(settings.WindowIndex, 0, Math.Max(0, usage.Windows.Count - 1)));
-        var stale = usage != null && (error != null || DateTimeOffset.UtcNow - usage.FetchedAt > TimeSpan.FromMinutes(16));
+        var stale = usage != null && (accountError != null || DateTimeOffset.UtcNow - usage.FetchedAt > TimeSpan.FromMinutes(16));
         Percent.Text = selected == null ? signedIn ? "—" : "Sign in" : $"{selected.Remaining}%";
         Countdown.Text = selected == null ? "" : (stale ? "! " : "↻ ") + Usage.Countdown(selected.ResetAt, DateTimeOffset.UtcNow);
-        Handle.ToolTip = selected == null ? "Click to sign in with ChatGPT" : $"{selected.Name}: {selected.Remaining}% remaining\n{(stale ? "STALE · " : "")}{error ?? "Click for details · drag to move"}";
+        var limitTooltip = selected == null ? "Click for details" : $"{selected.Name}: {selected.Remaining}% remaining\n{(stale ? "STALE · " : "")}{accountError ?? "Click for details · drag to move"}";
+        Handle.ToolTip = activeAccount == null ? limitTooltip : $"{activeAccount.Label}\n{limitTooltip}";
         UpdateTray(selected == null ? "—" : stale ? "!" : selected.Remaining.ToString());
-        tray.Text = selected == null ? "Codex Usage · Sign in" : $"Codex · {selected.Remaining}% left · {Usage.Countdown(selected.ResetAt, DateTimeOffset.UtcNow)}{(stale ? " · stale" : "")}";
-        PlanLabel.Text = demo ? "DEMO DATA" : usage?.Plan.ToUpperInvariant() ?? "";
-        StatusLabel.Text = error ?? (login != null ? "Waiting for browser authorization…" : busy ? "Refreshing…" : usage != null ? $"{(stale ? "Stale · " : "")}Updated {usage.FetchedAt.LocalDateTime:g}" : "Sign in securely with your ChatGPT account.");
-        if (signedIn) AccountLabel.Text = demo ? "Preview · no account connected" : "Connected to ChatGPT";
+        tray.Text = selected == null ? "MultiCodexUsage · Sign in" : $"Codex · {selected.Remaining}% left · {Usage.Countdown(selected.ResetAt, DateTimeOffset.UtcNow)}{(stale ? " · stale" : "")}";
+        PlanLabel.Text = demo ? "DEMO DATA" : "";
+        StatusLabel.Text = loginError ?? error ?? (login != null ? "Waiting for browser authorization…" : busy ? "Refreshing…" : accountError ?? (usage != null ? $"{(stale ? "Stale · " : "")}Updated {usage.FetchedAt.LocalDateTime:g}" : signedIn ? "Refresh to load usage for this account." : "Sign in securely with your ChatGPT account."));
+        AccountLabel.Text = accounts.Count > 0 ? $"{accounts.Count} {(accounts.Count == 1 ? "account" : "accounts")}" : demo ? "Preview · no account connected" : "";
+        AccountActionLabel.Visibility = accounts.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        AccountBox.Visibility = accounts.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        AccountBox.IsEnabled = !busy;
         CreditsLabel.Text = usage == null ? "" : $"{usage.Resets} banked resets" + (usage.ResetExpiry is long expiry ? $" · next expires {DateTimeOffset.FromUnixTimeSeconds(expiry).LocalDateTime:g}" : "") + (usage.Balance == null ? "" : $" · Credit balance: {usage.Balance}");
-        SignInButton.Visibility = signedIn ? Visibility.Collapsed : Visibility.Visible;
-        SignInButton.IsEnabled = !busy;
+        SignInButton.Visibility = demo && signedIn ? Visibility.Collapsed : Visibility.Visible;
+        SignInButton.Content = signedIn ? "Add account" : "Sign in with ChatGPT";
+        SignInButton.IsEnabled = !busy && !demo;
         foreach (var b in new[] { RefreshButton, ResetButton, SignOutButton }) { b.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed; b.IsEnabled = !busy && !demo; }
         SignOutButton.Visibility = signedIn || recovery ? Visibility.Visible : Visibility.Collapsed;
+        SignOutButton.Content = signedIn ? "Sign out selected account" : "Clear saved sign-in";
         ResetButton.IsEnabled = !busy && !demo && (usage?.Resets > 0 || pendingReset);
         ResetButton.Content = pendingReset ? "Retry reset" : "Use reset";
         LimitCards.Children.Clear();
-        if (usage == null) return;
-        for (int i = 0; i < usage.Windows.Count; i++)
+        if (demoUsage != null) AddLimitCards(LimitCards, demoUsage, null);
+        foreach (var account in accounts) AddAccountSection(account);
+    }
+    private void AddAccountSection(Account account)
+    {
+        var section = new StackPanel();
+        var outline = new Border { Child = section, Padding = new Thickness(10), Margin = new Thickness(0, 6, 0, 8), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(1) };
+        outline.SetResourceReference(Border.BorderBrushProperty, account == activeAccount ? "AccentBrush" : "LineBrush");
+        section.Children.Add(new TextBlock { Text = account.Label, FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap });
+        var reading = account.Usage;
+        var summary = reading == null ? "Usage not available yet" : $"{reading.Plan.ToUpperInvariant()} · Updated {reading.FetchedAt.LocalDateTime:g}";
+        if (reading != null && (account.Error != null || DateTimeOffset.UtcNow - reading.FetchedAt > TimeSpan.FromMinutes(16))) summary += " · Stale";
+        var status = new TextBlock { Text = account.Error == null ? summary : $"{summary}\n{account.Error}", Margin = new Thickness(0, 3, 0, 8), FontSize = 11, TextWrapping = TextWrapping.Wrap };
+        status.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+        section.Children.Add(status);
+        if (reading != null) AddLimitCards(section, reading, account);
+        LimitCards.Children.Add(outline);
+    }
+    private void AddLimitCards(StackPanel container, Usage reading, Account? account)
+    {
+        for (int i = 0; i < reading.Windows.Count; i++)
         {
-            var index = i; var w = usage.Windows[i];
+            var index = i; var w = reading.Windows[i];
             var panel = new StackPanel();
             var row = new DockPanel();
             var amount = new TextBlock { Text = $"{w.Remaining}%", FontWeight = FontWeights.SemiBold, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
@@ -229,23 +328,63 @@ public partial class MainWindow : Window
             panel.Children.Add(new ProgressBar { Minimum = 0, Maximum = 100, Value = w.Remaining, Height = 4, Margin = new Thickness(0, 9, 0, 7), Foreground = Brush(w.Remaining <= 10 ? "#FF947F" : "#56BFA0"), Background = (Brush)Resources["LineBrush"], BorderThickness = new Thickness(0) });
             panel.Children.Add(new TextBlock { Text = w.ResetAt is long at ? $"Resets {DateTimeOffset.FromUnixTimeSeconds(at).LocalDateTime:g} · {Usage.Countdown(at, DateTimeOffset.UtcNow)}" : "Reset time unavailable", FontSize = 11, Foreground = (Brush)Resources["MutedBrush"], TextWrapping = TextWrapping.Wrap });
             var button = new System.Windows.Controls.Button { Content = panel, HorizontalContentAlignment = System.Windows.HorizontalAlignment.Stretch, Margin = new Thickness(0, 0, 0, 8), Padding = new Thickness(10), ToolTip = "Show this limit in the window", BorderThickness = new Thickness(0) };
-            button.Click += (_, _) => { settings = settings with { WindowIndex = index }; TrySaveSettings(); Render(); };
+            button.IsEnabled = !busy || account == activeAccount;
+            button.Click += (_, _) =>
+            {
+                if (account != null && account != activeAccount)
+                {
+                    if (busy) return;
+                    SelectAccount(account);
+                    error = null;
+                    loginError = null;
+                }
+                settings = settings with { WindowIndex = index };
+                TrySaveSettings();
+                Render();
+            };
             System.Windows.Automation.AutomationProperties.SetName(button, $"{w.Name}, {w.Remaining}% remaining. Select for compact display");
-            LimitCards.Children.Add(button);
+            container.Children.Add(button);
         }
     }
     private async void SignIn(object sender, RoutedEventArgs e)
     {
         if (busy || demo) return;
-        busy = true; error = null; login = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token); Render();
+        busy = true; error = null; loginError = null; login = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token); Render();
+        var step = "Requesting a device code";
         try {
             var code = await api.StartLogin(login.Token);
+            step = "Completing browser authorization";
             DeviceCodeText.Text = code.Code; LoginPanel.Visibility = Visibility.Visible;
             StatusLabel.Text = "Waiting for browser authorization…";
             OpenBrowser();
-            await api.FinishLogin(code, login.Token);
-            signedIn = true; recovery = false; pendingReset = false; usage = null; await FetchAndRender("sign-in");
-        } catch (Exception ex) { error = FriendlyError(ex); }
+            var session = await api.FinishLogin(code, login.Token);
+            step = "Saving the authorized account";
+            var account = accounts.Find(item => item.Id == session.AccountId);
+            var store = account?.Store ?? storage.ForAccount(session.AccountId);
+            store.SaveSession(session);
+            if (account == null)
+            {
+                account = new Account(store, session, null, false);
+                accounts.Add(account);
+            }
+            account.Label = AccountLabelFor(session);
+            SelectAccount(account);
+            TrySaveSettings();
+            try { await FetchAccount(account, "sign-in"); }
+            catch (Exception ex) { account.Error = "Account saved. Could not read its usage. " + FriendlyError(ex); }
+        }
+        catch (OperationCanceledException) when (login.IsCancellationRequested) { }
+        catch (HttpRequestException ex) when (ex.StatusCode is HttpStatusCode status)
+        {
+            var detail = status switch
+            {
+                HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden when LoginPanel.Visibility == Visibility.Visible => "Check device code authorization in the target account’s ChatGPT security settings, then try again.",
+                HttpStatusCode.TooManyRequests => "Wait before requesting another code.",
+                _ => "Try again in a moment."
+            };
+            loginError = $"{step} failed (HTTP {(int)status}). {detail}";
+        }
+        catch (Exception ex) { loginError = $"{step} failed. {FriendlyError(ex)}"; }
         finally { login.Dispose(); login = null; busy = false; LoginPanel.Visibility = Visibility.Collapsed; DeviceCodeText.Clear(); if (!closing) Render(); }
     }
     private void OpenBrowser() { try { Process.Start(new ProcessStartInfo("https://auth.openai.com/codex/device") { UseShellExecute = true }); } catch { StatusLabel.Text = "Open https://auth.openai.com/codex/device in your browser."; } }
@@ -255,25 +394,36 @@ public partial class MainWindow : Window
     private void SignOut(object sender, RoutedEventArgs e)
     {
         if (busy || demo) return;
-        try { storage.ClearSession(); signedIn = false; recovery = false; pendingReset = false; usage = null; error = null; AccountLabel.Text = "Your limits, always in view."; }
+        try
+        {
+            var account = activeAccount;
+            (account?.Store ?? storage).ClearSession();
+            if (account == null || account.Store == storage) recovery = false;
+            if (account != null) accounts.Remove(account);
+            SelectAccount(accounts.FirstOrDefault());
+            error = null;
+            loginError = null;
+            TrySaveSettings();
+        }
         catch (Exception ex) { error = FriendlyError(ex); }
         Render();
     }
     private async void ResetClick(object sender, RoutedEventArgs e)
     {
-        if (busy || !signedIn || demo) return;
+        if (busy || activeAccount is not Account account || demo) return;
         busy = true; Render();
         try {
-            await FetchAndRender("reset-precheck"); Render();
-            if (usage!.Resets < 1 && !pendingReset) { error = "No banked resets are available."; return; }
-            var message = pendingReset ? "Retry the pending reset with the same request ID? If it was already redeemed, no additional credit will be spent." : "Use one banked reset? This spends one reset credit and resets the eligible usage windows.";
-            if (System.Windows.MessageBox.Show(this, message, "Confirm usage reset", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
-            pendingReset = true;
-            var result = await api.ConsumeReset(lifetime.Token);
-            pendingReset = false;
             error = null;
-            System.Windows.MessageBox.Show(this, result switch { "reset" => "Usage reset completed.", "already_redeemed" => "This request was already redeemed. No additional credit was spent.", "no_credit" => "No reset credit is available.", _ => "No usage window needs a reset." }, "Codex Usage");
-            await FetchAndRender("reset-postcheck");
+            await FetchAccount(account, "reset-precheck"); Render();
+            if (account.Usage!.Resets < 1 && !account.PendingReset) { error = "No banked resets are available."; return; }
+            var message = account.PendingReset ? "Retry the pending reset with the same request ID? If it was already redeemed, no additional credit will be spent." : "Use one banked reset? This spends one reset credit and resets the eligible usage windows.";
+            if (System.Windows.MessageBox.Show(this, $"{account.Label}\n\n{message}", "Confirm usage reset", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+            account.PendingReset = true;
+            var result = await account.Api.ConsumeReset(lifetime.Token);
+            account.PendingReset = false;
+            error = null;
+            System.Windows.MessageBox.Show(this, result switch { "reset" => "Usage reset completed.", "already_redeemed" => "This request was already redeemed. No additional credit was spent.", "no_credit" => "No reset credit is available.", _ => "No usage window needs a reset." }, Title);
+            await FetchAccount(account, "reset-postcheck");
         } catch (Exception ex) { error = FriendlyError(ex) + " If a reset was sent, retry Use reset safely with the saved request ID."; }
         finally { busy = false; if (!closing) Render(); }
     }
@@ -319,8 +469,8 @@ public partial class MainWindow : Window
         try {
             Directory.CreateDirectory(smokeOutput!);
             await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
-            if (ActualWidth != 340 || Details.Visibility != Visibility.Visible) throw new Exception($"Initial sign-in panel is clipped: {ActualWidth}");
-            usage = DemoUsage(); signedIn = true;
+            if (Math.Abs(ActualWidth - 340) > 1 || Details.Visibility != Visibility.Visible) throw new Exception($"Initial sign-in panel is clipped: {ActualWidth}");
+            demoUsage = DemoUsage();
             UpdateTray("84");
             using (var iconBitmap = tray.Icon!.ToBitmap()) {
                 var top = iconBitmap.Height; var bottom = -1;
@@ -332,10 +482,11 @@ public partial class MainWindow : Window
                 iconBitmap.Save(Path.Combine(smokeOutput!, "tray-84.png"));
             }
             ApplyTheme(false); SetExpanded(false); Render(); await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
-            if (Percent.Text != "86%" || Width != 190 || Details.Visibility != Visibility.Collapsed || !tray.Visible) throw new Exception("Compact view / tray");
+            if (Percent.Text != "86%" || Math.Abs(Width - 190) > 1 || Details.Visibility != Visibility.Collapsed || !tray.Visible)
+                throw new Exception($"Compact view / tray: percentage={Percent.Text}, width={Width}, details={Details.Visibility}, tray={tray.Visible}");
             Capture("compact.png");
             SetExpanded(true); await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
-            if (LimitCards.Children.Count != 3 || Width != 340 || Details.Visibility != Visibility.Visible) throw new Exception("Details");
+            if (LimitCards.Children.Count != 3 || Math.Abs(Width - 340) > 1 || Details.Visibility != Visibility.Visible) throw new Exception("Details");
             Capture("expanded.png");
             if (FindName("FloatingCheck") is not null) throw new Exception("Floating window switch should be removed");
             ShowPanel(); SetExpanded(false); if (IsVisible) throw new Exception("Collapsing details must return to tray-only mode");
@@ -352,13 +503,31 @@ public partial class MainWindow : Window
             interval.SelectedIndex = 2;
             if (storage.Read<Settings>("settings.json")?.RefreshMinutes != 5) throw new Exception("Interval preference was not restored");
             ApplyTheme(true); Render(); await Dispatcher.Yield(DispatcherPriority.ApplicationIdle); Capture("light.png");
-            usage = usage! with { FetchedAt = DateTimeOffset.UtcNow.AddHours(-1) }; Render();
+            demoUsage = demoUsage! with { FetchedAt = DateTimeOffset.UtcNow.AddHours(-1) }; Render();
             if (!Countdown.Text.StartsWith("! ")) throw new Exception("Stale indicator");
             PinnedCheck.IsChecked = false; PinChanged(this, new()); if (Topmost) throw new Exception("Unpin");
             HideClick(this, new()); if (IsVisible) throw new Exception("Hide"); ShowPanel(); if (!IsVisible) throw new Exception("Restore");
             SetExpanded(false); SaveSettings();
             var saved = storage.Read<Settings>("settings.json"); if (saved?.WindowIndex != 1 || saved.Pinned) throw new Exception("Preferences persistence");
-            File.WriteAllText(Path.Combine(smokeOutput!, "smoke-result.txt"), "PASS: initial sign-in width, large tray digits, tray-only mode, compact, expand, three limit cards, select limit, auto-refresh interval, light/dark render, stale indicator, pin, hide/restore, settings persistence, tray.\n");
+            demoUsage = null;
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var first = new Session("", "", "", "account-a", "first@example.invalid", null);
+            var second = first with { AccountId = "account-b", Email = "second@example.invalid" };
+            accounts.Add(new(storage.ForAccount(first.AccountId), first, new Usage("pro", new() { new("Primary", 86, now + 3600, 18000) }, 0, null, DateTimeOffset.UtcNow), false));
+            accounts.Add(new(storage.ForAccount(second.AccountId), second, new Usage("plus", new() { new("Primary", 32, now + 86400, 18000) }, 0, null, DateTimeOffset.UtcNow), false));
+            var third = first with { AccountId = "account-c", Email = "third@example.invalid" };
+            accounts.Add(new(storage.ForAccount(third.AccountId), third, null, false));
+            ShowPanel(); SelectAccount(accounts[0]); Render();
+            if (LimitCards.Children.Count != 3) throw new Exception("Every account must have its own usage section");
+            var sections = LimitCards.Children.Cast<Border>().Select(card => (StackPanel)card.Child).ToArray();
+            string LimitText(StackPanel section) => System.Windows.Automation.AutomationProperties.GetName(section.Children[2]);
+            if (!LimitText(sections[0]).Contains("86%") || !LimitText(sections[1]).Contains("32%") || ((TextBlock)sections[2].Children[1]).Text != "Usage not available yet")
+                throw new Exception("Account sections must simultaneously show independent usage or an empty state");
+            var firstCountdown = Countdown.Text;
+            ((System.Windows.Controls.Button)sections[1].Children[2]).RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+            if (Percent.Text != "32%" || Countdown.Text == firstCountdown || !((string)AccountBox.SelectedItem).Contains(second.Email!) || storage.Read<Settings>("settings.json")?.SelectedAccountId != second.AccountId) throw new Exception("Switching accounts must update usage and reset time");
+            Capture("accounts.png");
+            File.WriteAllText(Path.Combine(smokeOutput!, "smoke-result.txt"), "PASS: compact and expanded views, limit selection, refresh interval, light/dark render, stale indicator, pin, hide/restore, settings persistence, tray, simultaneous account sections and account selection with independent reset times.\n");
             Close();
         } catch (Exception e) { File.WriteAllText(Path.Combine(smokeOutput!, "smoke-result.txt"), e.ToString()); System.Windows.Application.Current.Shutdown(1); }
     }

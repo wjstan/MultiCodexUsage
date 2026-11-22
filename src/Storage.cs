@@ -1,11 +1,16 @@
 using System.IO;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 namespace CodexUsage;
 public class Storage(string directory)
 {
     public UsageLog Log { get; } = new(directory);
     private string FilePath(string name) => Path.Combine(directory, name);
+    public IEnumerable<Storage> AccountStores() => Directory.Exists(FilePath("accounts"))
+        ? Directory.EnumerateDirectories(FilePath("accounts")).Select(path => new Storage(path))
+        : Enumerable.Empty<Storage>();
+    public Storage ForAccount(string accountId) => new(FilePath(Path.Combine("accounts", Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(accountId))))));
     public void Write(string name, byte[] bytes)
     {
         Directory.CreateDirectory(directory);
@@ -30,4 +35,4 @@ public class Storage(string directory)
     public void ClearSession() { Log.Clear(); File.Delete(FilePath("session.bin")); File.Delete(FilePath("usage.json")); CompleteReset(); }
     private record Pending(string AccountId, string RequestId);
 }
-public record Settings(double? Left = null, double? Top = null, bool Pinned = true, bool Notify = true, int WindowIndex = 0, int RefreshMinutes = 5);
+public record Settings(double? Left = null, double? Top = null, bool Pinned = true, bool Notify = true, int WindowIndex = 0, int RefreshMinutes = 5, string? SelectedAccountId = null);

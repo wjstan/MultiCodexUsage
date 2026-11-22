@@ -1,3 +1,8 @@
+## Unreleased
+
+- Added support for multiple ChatGPT accounts and a shared panel showing each account's limits and reset times.
+- Renamed the executable to `MultiCodexUsage.exe`. Existing account data and preferences are carried forward.
+
 ## v0.1.6
 
 - **Banked resets now show when they expire.** The credits row reads the reset details and displays the next expiration as a local date and time (for example, "2 banked resets · next expires 6/20/2026 8:30 AM"). Only available resets count, the earliest expiration is shown, and a failed details call degrades to the plain count.

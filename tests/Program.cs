@@ -47,6 +47,13 @@ try {
     storage.SaveSession(session);
     Check(storage.LoadSession() == session, "DPAPI round trip");
     Check(!Encoding.UTF8.GetString(File.ReadAllBytes(Path.Combine(directory, "session.bin"))).Contains("test-refresh"), "No plaintext tokens");
+    var secondSession = session with { AccountId = "account-two", Email = "second@example.invalid" };
+    var secondStore = storage.ForAccount(secondSession.AccountId);
+    secondStore.SaveSession(secondSession);
+    secondStore.Save("usage.json", usage);
+    var secondReset = secondStore.PendingReset(secondSession.AccountId);
+    Check(storage.AccountStores().Single().LoadSession() == secondSession && storage.LoadSession() == session, "New account and legacy account coexist across restart");
+    Check(storage.Read<Usage>("usage.json") == null, "Account usage cache is isolated");
     var requestId = storage.PendingReset(session.AccountId);
     Check(storage.HasPendingReset(session.AccountId), "Pending reset can be retried even if balance is now zero");
     Check(new Storage(directory).PendingReset(session.AccountId) == requestId, "Reset survives restart");
@@ -58,6 +65,7 @@ try {
     File.WriteAllText(Path.Combine(directory, "activity.1.jsonl"), "{}\n");
     storage.ClearSession();
     Check(storage.LoadSession() == null, "Sign out deletes credentials");
+    Check(secondStore.LoadSession() == secondSession && secondStore.Read<Usage>("usage.json")?.Resets == usage.Resets && secondStore.PendingReset(secondSession.AccountId) == secondReset, "Signing out leaves other accounts, usage and pending resets intact");
     Check(!File.Exists(Path.Combine(directory, "activity.jsonl")) && !File.Exists(Path.Combine(directory, "activity.1.jsonl")), "Sign out deletes current and rotated refresh logs");
     var calls = new List<string>();
     var handler = new FakeHandler(async request => {

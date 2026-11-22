@@ -92,7 +92,7 @@ public record Session(string AccessToken, string RefreshToken, string IdToken, s
         using var claims = Claims(id);
         using var accessClaims = Claims(access);
         string? Account(JsonElement p) => p.TryGetProperty("https://api.openai.com/auth", out var auth) ? Usage.Text(auth, "chatgpt_account_id") : null;
-        var account = Account(claims.RootElement) ?? Account(accessClaims.RootElement) ?? throw new FormatException("Missing ChatGPT account ID.");
+        var account = (previous != null ? Account(accessClaims.RootElement) : null) ?? Account(claims.RootElement) ?? Account(accessClaims.RootElement) ?? throw new FormatException("Missing ChatGPT account ID.");
         return new(access, refresh, id, account, Usage.Text(claims.RootElement, "email") ?? previous?.Email, Usage.Number(accessClaims.RootElement, "exp"));
     }
     private static JsonDocument Claims(string token)

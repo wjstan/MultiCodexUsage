@@ -19,7 +19,7 @@ jobs:
         run: ./build.ps1
       - uses: actions/upload-artifact@v4
         with:
-          name: Codex-Usage-Windows-win-x64
+          name: MultiCodexUsage-win-x64
           path: artifacts/release/*
       - uses: actions/upload-artifact@v4
         with:

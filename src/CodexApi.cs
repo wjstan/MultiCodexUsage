@@ -1,15 +1,18 @@
 using System.Net.Http;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Text;
 using System.Text.Json;
 namespace CodexUsage;
 public class CodexApi(Storage storage, HttpClient? http = null)
 {
     private const string Issuer = "https://auth.openai.com";
     private const string ClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
-    private readonly HttpClient client = http ?? new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(25) };
-    private static StringContent Json(object value) => new(JsonSerializer.Serialize(value), Encoding.UTF8, "application/json");
+    private static readonly HttpClient SharedClient = new(new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false }) { Timeout = TimeSpan.FromSeconds(25) };
+    private readonly HttpClient client = http ?? SharedClient;
+    private static ByteArrayContent Json(object value) => new(JsonSerializer.SerializeToUtf8Bytes(value))
+    {
+        Headers = { ContentType = new MediaTypeHeaderValue("application/json") }
+    };
     private async Task<string> Send(HttpRequestMessage request, CancellationToken ct)
     {
         using (request)
@@ -29,7 +32,7 @@ public class CodexApi(Storage storage, HttpClient? http = null)
         var interval = r.TryGetProperty("interval", out var p) && int.TryParse(p.ToString(), out var n) ? Math.Clamp(n, 1, 60) : 5;
         return new(Usage.Text(r, "device_auth_id") ?? throw new FormatException("Missing device authorization ID."), code, interval);
     }
-    public async Task FinishLogin(DeviceCode code, CancellationToken ct)
+    public async Task<Session> FinishLogin(DeviceCode code, CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromMinutes(15));
@@ -45,13 +48,13 @@ public class CodexApi(Storage storage, HttpClient? http = null)
                 ["grant_type"] = "authorization_code", ["client_id"] = ClientId, ["redirect_uri"] = Issuer + "/deviceauth/callback",
                 ["code"] = r.GetProperty("authorization_code").GetString()!, ["code_verifier"] = r.GetProperty("code_verifier").GetString()!
             }) }, timeout.Token);
-            storage.SaveSession(Session.Parse(tokenJson));
-            return;
+            return Session.Parse(tokenJson);
         }
     }
     private async Task<Session> Refresh(Session session, CancellationToken ct)
     {
         var result = Session.Parse(await Send(new(HttpMethod.Post, Issuer + "/oauth/token") { Content = Json(new { client_id = ClientId, grant_type = "refresh_token", refresh_token = session.RefreshToken }) }, ct), session);
+        if (result.AccountId != session.AccountId) throw new FormatException("Refreshed credentials belong to a different account.");
         storage.SaveSession(result);
         return result;
     }
